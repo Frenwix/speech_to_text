@@ -449,26 +449,17 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       os_log(
         "Error removing trap: %{PUBLIC}@", log: pluginLog, type: .error, error.localizedDescription)
     }
+    // Colloquial fork: the category restore and setActive(false) that
+    // upstream performs here are removed. The AVAudioSession is process-wide
+    // and this app runs recognition DURING a CallKit call: deactivating the
+    // session on every listen end deactivates CALLKIT's session, CallKit
+    // toggles it back (ACTION_CALL_TOGGLE_AUDIO_SESSION), and the next
+    // activation races it - intermittently failing with OSStatus '!pla'
+    // (561017449, "Session activation failed") and leaving the recognizer's
+    // input dead. The app owns session configuration end to end
+    // (in_call_session_screen.dart's _routeAudioIos and _configureAudio in
+    // the review screens); the plugin must not manage the session lifecycle.
     #if os(iOS)
-      do {
-        if let rememberedAudioCategory = rememberedAudioCategory,
-          let rememberedAudioCategoryOptions = rememberedAudioCategoryOptions
-        {
-          try self.audioSession.setCategory(
-            rememberedAudioCategory, options: rememberedAudioCategoryOptions)
-        }
-      } catch {
-        os_log(
-          "Error stopping listen: %{PUBLIC}@", log: pluginLog, type: .error,
-          error.localizedDescription)
-      }
-      do {
-        try self.audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-      } catch {
-        os_log(
-          "Error deactivation: %{PUBLIC}@", log: pluginLog, type: .info, error.localizedDescription)
-      }
-
     #endif
     self.invokeFlutter(
       SwiftSpeechToTextCallbackMethods.notifyStatus, arguments: SpeechToTextStatus.done.rawValue)
