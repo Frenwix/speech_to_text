@@ -505,18 +505,15 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
         }
       }
 
+      // Colloquial fork: upstream reconfigured the process-wide session here
+      // on every listen - setCategory with .defaultToSpeaker (hijacking the
+      // call's earpiece route, see the app's #470/#485), setMode(.default)
+      // (dropping out of .voiceChat, so recognition during a speakerphone
+      // call lost the OS's far-field speakerphone capture profile and only
+      // heard a mouth held to the mic), and setActive(true) (racing
+      // CallKit). The host app guarantees a playAndRecord session before any
+      // listen; the plugin uses whatever session shape the app configured.
       #if os(iOS)
-        rememberedAudioCategory = self.audioSession.category
-        rememberedAudioCategoryOptions = self.audioSession.categoryOptions
-        try self.audioSession.setCategory(
-          AVAudioSession.Category.playAndRecord,
-          options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .mixWithOthers])
-        //            try self.audioSession.setMode(AVAudioSession.Mode.measurement)
-        if sampleRate > 0 {
-          try self.audioSession.setPreferredSampleRate(Double(sampleRate))
-        }
-        try self.audioSession.setMode(AVAudioSession.Mode.default)
-        try self.audioSession.setActive(true, options: .notifyOthersOnDeactivation)
         if #available(iOS 13.0, *) {
           try self.audioSession.setAllowHapticsAndSystemSoundsDuringRecording(enableHaptics)
         }
