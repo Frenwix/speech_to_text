@@ -18,6 +18,8 @@ public enum SwiftSpeechToTextMethods: String {
   case stop
   case cancel
   case locales
+  case recognitionAvailability
+  case triggerModelDownload
   case unknown  // just for testing
 }
 
@@ -218,6 +220,24 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
             }
         } else {
             locales(result)
+        }
+    case SwiftSpeechToTextMethods.recognitionAvailability.rawValue:
+        guard let argsArr = call.arguments as? [String: AnyObject],
+              let localeId = argsArr["localeId"] as? String
+        else {
+            DispatchQueue.main.async {
+                result(FlutterError(code: SpeechToTextErrors.missingOrInvalidArg.rawValue,
+                                    message: "localeId is required", details: nil))
+            }
+            return
+        }
+        recognitionAvailability(result, localeId: localeId)
+    case SwiftSpeechToTextMethods.triggerModelDownload.rawValue:
+        // iOS has no API to fetch a dictation language on the app's behalf — the
+        // user does it in Settings. Answering false keeps the Dart side honest
+        // rather than letting it offer a button that cannot work.
+        DispatchQueue.main.async {
+            result(false)
         }
     default:
       os_log("Unrecognized method: %{PUBLIC}@", log: pluginLog, type: .error, call.method)
@@ -663,6 +683,50 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
     }
     DispatchQueue.main.async {
       result(localeNames)
+    }
+  }
+
+  /// Reports whether a language can be recognised right now.
+  ///
+  /// Unlike Android there is nothing to download on the app's behalf: a locale in
+  /// `supportedLocales()` works over the network without any user action, so the
+  /// interesting answer is simply supported vs not. `unknown` is reserved for a
+  /// query that could not be answered and must never be conflated with
+  /// `unsupported` — callers use these to decide whether to nag the user.
+  private func recognitionAvailability(_ result: @escaping FlutterResult, localeId: String) {
+    let wanted = localeId.replacingOccurrences(of: "_", with: "-").lowercased()
+    let wantedLanguage = wanted.split(separator: "-").first.map(String.init) ?? wanted
+    let supported = SFSpeechRecognizer.supportedLocales()
+
+    var status = "unsupported"
+    var onDevice = false
+
+    if supported.isEmpty {
+      // An empty list is not evidence of absence.
+      status = "unknown"
+    } else {
+      let match = supported.first { locale in
+        let candidate = locale.identifier.replacingOccurrences(of: "_", with: "-").lowercased()
+        return candidate == wanted
+          || candidate.split(separator: "-").first.map(String.init) == wantedLanguage
+      }
+      if let match = match {
+        status = "installed"
+        if #available(iOS 13.0, *), let recognizer = SFSpeechRecognizer(locale: match) {
+          onDevice = recognizer.supportsOnDeviceRecognition
+        }
+      }
+    }
+
+    let payload: [String: Any] = [
+      "status": status,
+      "localeId": localeId,
+      "onDevice": onDevice,
+      // No iOS API fetches a dictation language for us.
+      "canTriggerDownload": false,
+    ]
+    DispatchQueue.main.async {
+      result(payload)
     }
   }
 

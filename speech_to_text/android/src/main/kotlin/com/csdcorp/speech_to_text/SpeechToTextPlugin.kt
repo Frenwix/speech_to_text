@@ -135,6 +135,8 @@ public class SpeechToTextPlugin :
     private val defaultLanguageTag: String = Locale.getDefault().toLanguageTag()
     private var timer: Timer? = null
     private lateinit var timerTask: TimerTask
+    private var downloadRecognizer: SpeechRecognizer? = null
+    private val availabilityTimeoutMs: Long = 4000
 
     override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
 
@@ -222,6 +224,24 @@ public class SpeechToTextPlugin :
                 "stop" -> stopListening(result)
                 "cancel" -> cancelListening(result)
                 "locales" -> locales(result)
+                "recognitionAvailability" -> {
+                    val localeId = call.argument<String>("localeId")
+                    if (null == localeId) {
+                        result.error(SpeechToTextErrors.missingOrInvalidArg.name,
+                                "localeId is required", null)
+                        return
+                    }
+                    recognitionAvailability(result, localeId.replace('_', '-'))
+                }
+                "triggerModelDownload" -> {
+                    val localeId = call.argument<String>("localeId")
+                    if (null == localeId) {
+                        result.error(SpeechToTextErrors.missingOrInvalidArg.name,
+                                "localeId is required", null)
+                        return
+                    }
+                    triggerModelDownload(result, localeId.replace('_', '-'))
+                }
                 else -> result.notImplemented()
             }
         } catch (exc: Exception) {
@@ -400,6 +420,172 @@ public class SpeechToTextPlugin :
             pluginContext?.sendOrderedBroadcast(
                     detailsIntent, null, LanguageDetailsChecker(result, debugLogging),
                     null, Activity.RESULT_OK, null, null)
+        }
+    }
+
+    /**
+     * Reports whether a given language can be recognised *right now*, which is a
+     * different question from the one [locales] answers.
+     *
+     * [locales] returns `supportedOnDeviceLanguages` — languages that could work
+     * once a model is downloaded. Selecting one of those and calling listen fails
+     * with ERROR_LANGUAGE_UNAVAILABLE. RecognitionSupport keeps four separate
+     * lists and this method keeps them separate too:
+     *
+     *   installed    -> usable now (model downloaded, or the language works online)
+     *   downloadable -> supported on device but not yet downloaded
+     *   pending      -> a download is already running
+     *   unsupported  -> no path to recognising this language on this device
+     *   unknown      -> the query itself could not be answered. Never conflated
+     *                   with unsupported: callers must not nag a user because a
+     *                   permission was missing or a callback never fired.
+     */
+    private fun recognitionAvailability(result: Result, localeId: String) {
+        val context = pluginContext
+        if (sdkVersionTooLow() || null == context) {
+            respondAvailability(result, "unknown", localeId)
+            return
+        }
+        val hasPermission = ContextCompat.checkSelfPermission(context,
+                Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        // checkRecognitionSupport reports nothing useful without the mic permission.
+        if (Build.VERSION.SDK_INT < 33 || !hasPermission) {
+            respondAvailability(result, "unknown", localeId)
+            return
+        }
+        if (!SpeechRecognizer.isRecognitionAvailable(context) &&
+                !SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
+            respondAvailability(result, "unsupported", localeId)
+            return
+        }
+
+        val responded = java.util.concurrent.atomic.AtomicBoolean(false)
+        val outstanding = java.util.concurrent.atomic.AtomicInteger(0)
+        val installed = Collections.synchronizedSet(HashSet<String>())
+        val onDeviceInstalled = Collections.synchronizedSet(HashSet<String>())
+        val downloadable = Collections.synchronizedSet(HashSet<String>())
+        val pending = Collections.synchronizedSet(HashSet<String>())
+        val answered = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        fun finish() {
+            if (!responded.compareAndSet(false, true)) return
+            val onDevice = matchesTag(onDeviceInstalled, localeId)
+            val status = when {
+                !answered.get() -> "unknown"
+                matchesTag(installed, localeId) -> "installed"
+                matchesTag(pending, localeId) -> "pending"
+                matchesTag(downloadable, localeId) -> "downloadable"
+                // An empty answer is not evidence of absence.
+                installed.isEmpty() && downloadable.isEmpty() && pending.isEmpty() -> "unknown"
+                else -> "unsupported"
+            }
+            respondAvailability(result, status, localeId, onDevice)
+        }
+
+        fun collect(support: RecognitionSupport) {
+            answered.set(true)
+            onDeviceInstalled.addAll(support.installedOnDeviceLanguages)
+            installed.addAll(support.installedOnDeviceLanguages)
+            // Online languages need the network, which a practice call already needs
+            // for its card audio, so they count as usable now.
+            installed.addAll(support.onlineLanguages)
+            downloadable.addAll(support.supportedOnDeviceLanguages)
+            pending.addAll(support.pendingOnDeviceLanguages)
+        }
+
+        val executor = Executors.newSingleThreadExecutor()
+        val recognizers = ArrayList<SpeechRecognizer>()
+        // The default recogniser knows about online languages; the on-device one is
+        // the only reliable source for the on-device lists. Ask both — either alone
+        // gives a partial and, in the unsupported direction, a wrong answer.
+        if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            createSpeechRecognizer(context)?.let { recognizers.add(it) }
+        }
+        if (SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
+            createOnDeviceSpeechRecognizer(context)?.let { recognizers.add(it) }
+        }
+        if (recognizers.isEmpty()) {
+            respondAvailability(result, "unknown", localeId)
+            return
+        }
+        outstanding.set(recognizers.size)
+
+        for (recognizer in recognizers) {
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeId)
+            try {
+                recognizer.checkRecognitionSupport(intent, executor,
+                        object : RecognitionSupportCallback {
+                            override fun onSupportResult(recognitionSupport: RecognitionSupport) {
+                                collect(recognitionSupport)
+                                recognizer.destroy()
+                                if (outstanding.decrementAndGet() <= 0) finish()
+                            }
+
+                            override fun onError(error: Int) {
+                                debugLog("checkRecognitionSupport error: $error")
+                                recognizer.destroy()
+                                if (outstanding.decrementAndGet() <= 0) finish()
+                            }
+                        })
+            } catch (exc: Exception) {
+                debugLog("checkRecognitionSupport threw: ${exc.localizedMessage}")
+                recognizer.destroy()
+                if (outstanding.decrementAndGet() <= 0) finish()
+            }
+        }
+
+        // Some recognition services never call back at all; without this the Dart
+        // side would await forever rather than fall back to tap-only rating.
+        Handler(Looper.getMainLooper()).postDelayed({ finish() }, availabilityTimeoutMs)
+    }
+
+    /** Exact tag first, then language subtag: "pl" answers for a "pl-PL" request. */
+    private fun matchesTag(tags: Set<String>, localeId: String): Boolean {
+        val wanted = localeId.replace('_', '-').lowercase()
+        val wantedLanguage = wanted.substringBefore('-')
+        return tags.any { tag ->
+            val candidate = tag.replace('_', '-').lowercase()
+            candidate == wanted || candidate.substringBefore('-') == wantedLanguage
+        }
+    }
+
+    private fun respondAvailability(result: Result, status: String, localeId: String,
+                                    onDevice: Boolean = false) {
+        val payload = HashMap<String, Any>()
+        payload["status"] = status
+        payload["localeId"] = localeId
+        payload["onDevice"] = onDevice
+        payload["canTriggerDownload"] = Build.VERSION.SDK_INT >= 33 && status == "downloadable"
+        result.success(payload)
+    }
+
+    /**
+     * Asks the on-device recognition service to fetch the model for [localeId].
+     * API 33's overload has no completion callback, so this reports only that the
+     * request was accepted — the caller must re-query availability to see the
+     * outcome rather than assuming success.
+     */
+    private fun triggerModelDownload(result: Result, localeId: String) {
+        val context = pluginContext
+        if (sdkVersionTooLow() || null == context || Build.VERSION.SDK_INT < 33 ||
+                !SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
+            result.success(false)
+            return
+        }
+        try {
+            downloadRecognizer?.destroy()
+            val recognizer = createOnDeviceSpeechRecognizer(context)
+            downloadRecognizer = recognizer
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeId)
+            recognizer?.triggerModelDownload(intent)
+            // Destroying the recogniser immediately can cancel the download it just
+            // started, so it is held and released on the next request instead.
+            result.success(true)
+        } catch (exc: Exception) {
+            debugLog("triggerModelDownload failed: ${exc.localizedMessage}")
+            result.success(false)
         }
     }
 
