@@ -688,11 +688,17 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
 
   /// Reports whether a language can be recognised right now.
   ///
-  /// Unlike Android there is nothing to download on the app's behalf: a locale in
-  /// `supportedLocales()` works over the network without any user action, so the
-  /// interesting answer is simply supported vs not. `unknown` is reserved for a
-  /// query that could not be answered and must never be conflated with
-  /// `unsupported` — callers use these to decide whether to nag the user.
+  /// `status` describes ON-DEVICE readiness, matching Android's, so a caller that
+  /// requires on-device recognition gets one comparable answer from both
+  /// platforms. A locale that iOS supports only over the network is reported
+  /// `downloadable` — the user adds it under Settings > General > Keyboard >
+  /// Dictation Languages — with `canTriggerDownload: false`, because no iOS API
+  /// fetches it on the app's behalf. Network reachability is reported separately
+  /// as `online`.
+  ///
+  /// `unknown` is reserved for a query that could not be answered and is never
+  /// conflated with `unsupported`: callers use these to decide whether to tell
+  /// the user something is missing, and a failed query is not evidence of that.
   private func recognitionAvailability(_ result: @escaping FlutterResult, localeId: String) {
     let wanted = localeId.replacingOccurrences(of: "_", with: "-").lowercased()
     let wantedLanguage = wanted.split(separator: "-").first.map(String.init) ?? wanted
@@ -700,6 +706,7 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
 
     var status = "unsupported"
     var onDevice = false
+    var online = false
 
     if supported.isEmpty {
       // An empty list is not evidence of absence.
@@ -711,10 +718,11 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
           || candidate.split(separator: "-").first.map(String.init) == wantedLanguage
       }
       if let match = match {
-        status = "installed"
+        online = true
         if #available(iOS 13.0, *), let recognizer = SFSpeechRecognizer(locale: match) {
           onDevice = recognizer.supportsOnDeviceRecognition
         }
+        status = onDevice ? "installed" : "downloadable"
       }
     }
 
@@ -722,7 +730,7 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       "status": status,
       "localeId": localeId,
       "onDevice": onDevice,
-      // No iOS API fetches a dictation language for us.
+      "online": online,
       "canTriggerDownload": false,
     ]
     DispatchQueue.main.async {

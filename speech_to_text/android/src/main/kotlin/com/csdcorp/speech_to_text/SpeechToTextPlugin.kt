@@ -463,6 +463,7 @@ public class SpeechToTextPlugin :
         val outstanding = java.util.concurrent.atomic.AtomicInteger(0)
         val installed = Collections.synchronizedSet(HashSet<String>())
         val onDeviceInstalled = Collections.synchronizedSet(HashSet<String>())
+        val online = Collections.synchronizedSet(HashSet<String>())
         val downloadable = Collections.synchronizedSet(HashSet<String>())
         val pending = Collections.synchronizedSet(HashSet<String>())
         val answered = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -479,18 +480,21 @@ public class SpeechToTextPlugin :
                 installed.isEmpty() && downloadable.isEmpty() && pending.isEmpty() -> "unknown"
                 else -> "unsupported"
             }
-            respondAvailability(result, status, localeId, onDevice)
+            respondAvailability(result, status, localeId, onDevice,
+                    matchesTag(online, localeId))
         }
 
         fun collect(support: RecognitionSupport) {
             answered.set(true)
             onDeviceInstalled.addAll(support.installedOnDeviceLanguages)
             installed.addAll(support.installedOnDeviceLanguages)
-            // Online languages need the network, which a practice call already needs
-            // for its card audio, so they count as usable now.
-            installed.addAll(support.onlineLanguages)
             downloadable.addAll(support.supportedOnDeviceLanguages)
             pending.addAll(support.pendingOnDeviceLanguages)
+            // Reported separately, never folded into `status`: a caller that
+            // requires on-device recognition (for privacy, or to work offline)
+            // would be told a network-only language is ready and then fail at
+            // listen() with the very error this method exists to predict.
+            online.addAll(support.onlineLanguages)
         }
 
         val executor = Executors.newSingleThreadExecutor()
@@ -551,11 +555,12 @@ public class SpeechToTextPlugin :
     }
 
     private fun respondAvailability(result: Result, status: String, localeId: String,
-                                    onDevice: Boolean = false) {
+                                    onDevice: Boolean = false, online: Boolean = false) {
         val payload = HashMap<String, Any>()
         payload["status"] = status
         payload["localeId"] = localeId
         payload["onDevice"] = onDevice
+        payload["online"] = online
         payload["canTriggerDownload"] = Build.VERSION.SDK_INT >= 33 && status == "downloadable"
         result.success(payload)
     }
