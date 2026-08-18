@@ -13,11 +13,15 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.speech.*
 import android.speech.SpeechRecognizer.createOnDeviceSpeechRecognizer
 import android.speech.SpeechRecognizer.createSpeechRecognizer
@@ -117,6 +121,16 @@ public class SpeechToTextPlugin :
     private var bluetoothDisabled = true // final bluetooth state (combines user-defined option and permissions)
     private var resultSent: Boolean = false
     private var lastOnDevice: Boolean = false
+    // Feed the recogniser OUR capture instead of letting it open its own
+    // (#559). While this app owns a Telecom call, Android hands a
+    // different-process recogniser a successfully-opened input that reads
+    // zeros — no error, no denial, just silence — so on-device recognition
+    // can never hear the user. This app's own capture IS allowed (it owns
+    // the call), so capture here and pipe PCM in via EXTRA_AUDIO_SOURCE.
+    private var appAudioSource: Boolean = false
+    private var audioPumpThread: Thread? = null
+    @Volatile private var audioPumpRunning: Boolean = false
+    private val appAudioSampleRate = 16000
     private var speechRecognizer: SpeechRecognizer? = null
     private var recognizerIntent: Intent? = null
     private var bluetoothAdapter: android.bluetooth.BluetoothAdapter? = null
@@ -221,6 +235,14 @@ public class SpeechToTextPlugin :
                         call.argument<Int?>("pauseFor")
                     startListening(result, localeId, partialResults, listenModeIndex, onDevice, pauseFor )
                 }
+                "setAppAudioSource" -> {
+                    // Opt-in, set by the host app rather than inferred: only the
+                    // app knows it is inside a call, and this trades the
+                    // recogniser's own (better-tuned) capture for one that is
+                    // merely audible, so it must not be the default.
+                    appAudioSource = call.argument<Boolean>("enabled") == true
+                    result.success(appAudioSource)
+                }
                 "stop" -> stopListening(result)
                 "cancel" -> cancelListening(result)
                 "locales" -> locales(result)
@@ -318,7 +340,15 @@ public class SpeechToTextPlugin :
         setupRecognizerIntent(languageTag, partialResults, listenMode, onDevice, pauseFor )
         handler.post {
             run {
+                // Per listen, never baked into the cached intent:
+                // setupRecognizerIntent reuses one Intent across listens, and a
+                // pipe fd left on it would be closed and useless by the second.
+                val readSide = attachAppAudioSource()
                 speechRecognizer?.startListening(recognizerIntent)
+                // Our copy is redundant once the intent has been delivered; the
+                // recogniser holds its own dup. Closing before startListening
+                // would hand it a dead fd.
+                try { readSide?.close() } catch (e: Exception) { }
             }
         }
         speechStartTime = System.currentTimeMillis()
@@ -351,6 +381,7 @@ public class SpeechToTextPlugin :
             return
         }
         debugLog("Stop listening")
+        stopAppAudioPump()
         handler.post {
             run {
                 speechRecognizer?.stopListening()
@@ -370,6 +401,7 @@ public class SpeechToTextPlugin :
             return
         }
         debugLog("Cancel listening")
+        stopAppAudioPump()
         handler.post {
             run {
                 speechRecognizer?.cancel()
@@ -889,7 +921,118 @@ public class SpeechToTextPlugin :
         }
     }
 
+    // Returns the read end so the caller can close it AFTER startListening, or
+    // null when app-supplied audio is off/unavailable — in which case the
+    // recogniser opens its own capture exactly as before. Every failure here
+    // degrades to that old behaviour rather than breaking the listen: a call
+    // that rates by tapping is worse than one that rates by voice, but a call
+    // that crashes is worse than both.
+    private fun attachAppAudioSource(): ParcelFileDescriptor? {
+        val intent = recognizerIntent ?: return null
+        // A stale fd from a previous listen must never survive on the cached
+        // intent: it is already closed, and leaving it would starve the
+        // recogniser instead of letting it fall back to its own microphone.
+        intent.removeExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE)
+        if (!appAudioSource) return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
+        val context = pluginContext ?: return null
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) return null
+
+        stopAppAudioPump()
+
+        val minBuf = AudioRecord.getMinBufferSize(
+                appAudioSampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if (minBuf <= 0) return null
+        val bufSize = minBuf * 2
+
+        // VOICE_COMMUNICATION, not MIC: the answer clip is playing out of the
+        // same device during barge-in, and this source carries the platform's
+        // echo cancellation. Without it the recogniser transcribes our own
+        // playback.
+        val record = try {
+            AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, appAudioSampleRate,
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize)
+        } catch (e: Exception) {
+            debugLog("app audio source: AudioRecord ctor failed: $e")
+            null
+        } ?: return null
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            record.release()
+            return null
+        }
+
+        val pipe = try {
+            ParcelFileDescriptor.createPipe()
+        } catch (e: Exception) {
+            record.release()
+            return null
+        }
+        val readSide = pipe[0]
+        val writeSide = pipe[1]
+
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, readSide)
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, appAudioSampleRate)
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+
+        audioPumpRunning = true
+        try {
+            record.startRecording()
+        } catch (e: Exception) {
+            record.release()
+            try { readSide.close() } catch (e2: Exception) { }
+            try { writeSide.close() } catch (e2: Exception) { }
+            audioPumpRunning = false
+            return null
+        }
+
+        val pump = Thread {
+            val out = ParcelFileDescriptor.AutoCloseOutputStream(writeSide)
+            val buf = ByteArray(bufSize)
+            try {
+                while (audioPumpRunning) {
+                    val n = record.read(buf, 0, buf.size)
+                    if (n > 0) {
+                        out.write(buf, 0, n)
+                    } else if (n < 0) {
+                        break
+                    }
+                }
+            } catch (e: Exception) {
+                // The recogniser closed its end (normal end of listen), or the
+                // capture died. Either way this listen is over.
+                debugLog("app audio pump ended: $e")
+            } finally {
+                try { out.close() } catch (e: Exception) { }
+                try { record.stop() } catch (e: Exception) { }
+                record.release()
+            }
+        }
+        pump.isDaemon = true
+        pump.name = "stt-app-audio-pump"
+        audioPumpThread = pump
+        pump.start()
+        return readSide
+    }
+
+    // Closing the write end is what tells the recogniser the audio ended, so
+    // this must run on every path that finishes a listen — otherwise the
+    // recogniser waits out its own silence timeout on a stream nobody is
+    // feeding.
+    private fun stopAppAudioPump() {
+        audioPumpRunning = false
+        val pump = audioPumpThread ?: return
+        audioPumpThread = null
+        try {
+            pump.join(500)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
     private fun destroyRecognizer() {
+        stopAppAudioPump()
 
         handler.postDelayed( {
                 run {
