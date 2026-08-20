@@ -626,12 +626,24 @@ public class SpeechToTextPlugin :
      * request was accepted — the caller must re-query availability to see the
      * outcome rather than assuming success.
      */
+    // Answers a STRING outcome, not a boolean: "installed" | "scheduled" |
+    // "accepted" | "failed" | "unsupported". On API 34+ the listener overload
+    // exists and the result completes when the DOWNLOAD does — the caller's
+    // spinner is supposed to last exactly that long, and a failure becomes a
+    // known failure instead of a fire-and-forget shrug (the API 33 overload
+    // has no callback, hence "accepted" there).
     private fun triggerModelDownload(result: Result, localeId: String) {
         val context = pluginContext
         if (sdkVersionTooLow() || null == context || Build.VERSION.SDK_INT < 33 ||
                 !SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
-            result.success(false)
+            result.success("unsupported")
             return
+        }
+        val responded = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun respond(outcome: String) {
+            if (responded.compareAndSet(false, true)) {
+                handler.post { result.success(outcome) }
+            }
         }
         try {
             downloadRecognizer?.destroy()
@@ -639,13 +651,32 @@ public class SpeechToTextPlugin :
             downloadRecognizer = recognizer
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
             intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeId)
-            recognizer?.triggerModelDownload(intent)
-            // Destroying the recogniser immediately can cancel the download it just
-            // started, so it is held and released on the next request instead.
-            result.success(true)
+            if (Build.VERSION.SDK_INT >= 34) {
+                recognizer?.triggerModelDownload(intent,
+                        Executors.newSingleThreadExecutor(),
+                        object : ModelDownloadListener {
+                            override fun onProgress(completedPercent: Int) { }
+                            override fun onSuccess() = respond("installed")
+                            // The system queued it (Wi-Fi / idle constraints):
+                            // not done, not failed. A later onSuccess for the
+                            // same request is ignored by the responded guard —
+                            // the caller's next availability check sees it.
+                            override fun onScheduled() = respond("scheduled")
+                            override fun onError(error: Int) {
+                                debugLog("model download error: $error")
+                                respond("failed")
+                            }
+                        })
+            } else {
+                recognizer?.triggerModelDownload(intent)
+                // Destroying the recogniser immediately can cancel the download
+                // it just started, so it is held and released on the next
+                // request instead.
+                respond("accepted")
+            }
         } catch (exc: Exception) {
             debugLog("triggerModelDownload failed: ${exc.localizedMessage}")
-            result.success(false)
+            respond("failed")
         }
     }
 
