@@ -130,7 +130,6 @@ public class SpeechToTextPlugin :
     private var appAudioSource: Boolean = false
     private var audioPumpThread: Thread? = null
     private var pendingReadSide: ParcelFileDescriptor? = null
-    private var pendingWriteSide: ParcelFileDescriptor? = null
     private var audioPumpRecord: AudioRecord? = null
     @Volatile private var audioPumpRunning: Boolean = false
     private val appAudioSampleRate = 16000
@@ -501,6 +500,13 @@ public class SpeechToTextPlugin :
         val outstanding = java.util.concurrent.atomic.AtomicInteger(0)
         val installed = Collections.synchronizedSet(HashSet<String>())
         val onDeviceInstalled = Collections.synchronizedSet(HashSet<String>())
+        // Scoped to createOnDeviceSpeechRecognizer ONLY — `installed` above is a
+        // union across both recognisers, which over-reports: the default
+        // (network-capable) recogniser lists languages the on-device one has no
+        // model for, and onDevice listens run on the on-device one. This set is
+        // the authority for "which languages can an onDevice listen actually
+        // service" (#561).
+        val onDeviceRecognizerInstalled = Collections.synchronizedSet(HashSet<String>())
         val online = Collections.synchronizedSet(HashSet<String>())
         val downloadable = Collections.synchronizedSet(HashSet<String>())
         val pending = Collections.synchronizedSet(HashSet<String>())
@@ -519,11 +525,15 @@ public class SpeechToTextPlugin :
                 else -> "unsupported"
             }
             respondAvailability(result, status, localeId, onDevice,
-                    matchesTag(online, localeId))
+                    matchesTag(online, localeId),
+                    onDeviceRecognizerInstalled.toSortedSet().toList())
         }
 
-        fun collect(support: RecognitionSupport) {
+        fun collect(support: RecognitionSupport, fromOnDeviceRecognizer: Boolean) {
             answered.set(true)
+            if (fromOnDeviceRecognizer) {
+                onDeviceRecognizerInstalled.addAll(support.installedOnDeviceLanguages)
+            }
             onDeviceInstalled.addAll(support.installedOnDeviceLanguages)
             installed.addAll(support.installedOnDeviceLanguages)
             downloadable.addAll(support.supportedOnDeviceLanguages)
@@ -536,15 +546,17 @@ public class SpeechToTextPlugin :
         }
 
         val executor = Executors.newSingleThreadExecutor()
-        val recognizers = ArrayList<SpeechRecognizer>()
+        // Paired with which recogniser each is, so collect() can scope the
+        // installed set to the one onDevice listens actually use.
+        val recognizers = ArrayList<Pair<SpeechRecognizer, Boolean>>()
         // The default recogniser knows about online languages; the on-device one is
         // the only reliable source for the on-device lists. Ask both — either alone
         // gives a partial and, in the unsupported direction, a wrong answer.
         if (SpeechRecognizer.isRecognitionAvailable(context)) {
-            createSpeechRecognizer(context)?.let { recognizers.add(it) }
+            createSpeechRecognizer(context)?.let { recognizers.add(Pair(it, false)) }
         }
         if (SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
-            createOnDeviceSpeechRecognizer(context)?.let { recognizers.add(it) }
+            createOnDeviceSpeechRecognizer(context)?.let { recognizers.add(Pair(it, true)) }
         }
         if (recognizers.isEmpty()) {
             respondAvailability(result, "unknown", localeId)
@@ -552,14 +564,14 @@ public class SpeechToTextPlugin :
         }
         outstanding.set(recognizers.size)
 
-        for (recognizer in recognizers) {
+        for ((recognizer, isOnDeviceRecognizer) in recognizers) {
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
             intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeId)
             try {
                 recognizer.checkRecognitionSupport(intent, executor,
                         object : RecognitionSupportCallback {
                             override fun onSupportResult(recognitionSupport: RecognitionSupport) {
-                                collect(recognitionSupport)
+                                collect(recognitionSupport, isOnDeviceRecognizer)
                                 recognizer.destroy()
                                 if (outstanding.decrementAndGet() <= 0) finish()
                             }
@@ -593,13 +605,18 @@ public class SpeechToTextPlugin :
     }
 
     private fun respondAvailability(result: Result, status: String, localeId: String,
-                                    onDevice: Boolean = false, online: Boolean = false) {
+                                    onDevice: Boolean = false, online: Boolean = false,
+                                    installedLanguages: List<String> = emptyList()) {
         val payload = HashMap<String, Any>()
         payload["status"] = status
         payload["localeId"] = localeId
         payload["onDevice"] = onDevice
         payload["online"] = online
         payload["canTriggerDownload"] = Build.VERSION.SDK_INT >= 33 && status == "downloadable"
+        // The on-device recogniser's own installed enumeration (#561) — empty
+        // when unknown, which callers must treat as "no claim", never as
+        // "nothing installed".
+        payload["installedLanguages"] = installedLanguages
         result.success(payload)
     }
 
@@ -996,23 +1013,49 @@ public class SpeechToTextPlugin :
         intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
 
         val pump = Thread {
-            val out = ParcelFileDescriptor.AutoCloseOutputStream(writeSide)
+            // Non-blocking writes, and this thread is the write fd's ONLY
+            // owner. A recogniser that never consumes the pipe (missing
+            // language pack) fills its 64KB buffer in ~2s; a blocking write
+            // then parks forever and no flag or cross-thread close can free
+            // it safely — flag-then-join leaked one live thread and one
+            // ACTIVE AudioRecord per listen (the French dead-loop,
+            // 2026-08-20), and closing the fd from another thread risks
+            // closing a recycled fd number. EAGAIN + bounded sleep keeps the
+            // running flag honest instead.
+            try {
+                android.system.Os.fcntlInt(writeSide.fileDescriptor,
+                        android.system.OsConstants.F_SETFL,
+                        android.system.OsConstants.O_NONBLOCK)
+            } catch (e: Exception) {
+                debugLog("app audio pump: O_NONBLOCK failed: $e")
+            }
             val buf = ByteArray(bufSize)
             try {
-                while (audioPumpRunning) {
+                pump@ while (audioPumpRunning) {
                     val n = record.read(buf, 0, buf.size)
-                    if (n > 0) {
-                        out.write(buf, 0, n)
-                    } else if (n < 0) {
-                        break
+                    if (n <= 0) break
+                    var off = 0
+                    while (off < n) {
+                        if (!audioPumpRunning) break@pump
+                        try {
+                            val w = android.system.Os.write(
+                                    writeSide.fileDescriptor, buf, off, n - off)
+                            if (w > 0) off += w
+                        } catch (e: android.system.ErrnoException) {
+                            if (e.errno == android.system.OsConstants.EAGAIN) {
+                                Thread.sleep(20)
+                            } else {
+                                // EPIPE: the recogniser closed its end — the
+                                // normal end of a consumed listen.
+                                break@pump
+                            }
+                        }
                     }
                 }
             } catch (e: Exception) {
-                // The recogniser closed its end (normal end of listen), or the
-                // capture died. Either way this listen is over.
                 debugLog("app audio pump ended: $e")
             } finally {
-                try { out.close() } catch (e: Exception) { }
+                try { writeSide.close() } catch (e: Exception) { }
                 try { record.stop() } catch (e: Exception) { }
                 record.release()
             }
@@ -1021,7 +1064,6 @@ public class SpeechToTextPlugin :
         pump.name = "stt-app-audio-pump"
         audioPumpThread = pump
         pendingReadSide = readSide
-        pendingWriteSide = writeSide
         audioPumpRecord = record
         pump.start()
     }
@@ -1034,19 +1076,13 @@ public class SpeechToTextPlugin :
         audioPumpRunning = false
         try { pendingReadSide?.close() } catch (e: Exception) { }
         pendingReadSide = null
-        // Unblock the pump BEFORE joining, or the join is theatre. When the
-        // recogniser never consumes the pipe (missing language pack: the
-        // French dead-loop, 2026-08-20), the pump fills the 64KB pipe buffer
-        // in ~2s and blocks in write() forever — the running flag is only
-        // re-checked between writes, so flag-then-join leaked one live thread
-        // and one ACTIVE AudioRecord per listen. The plugin outlives the call
-        // inside the Flutter engine, so those leaks silenced every later
-        // call's capture until the process died: "voice rating broke and
-        // stayed broken". Closing the write end makes the blocked write throw
-        // (its finally releases the record); stopping the record unblocks a
-        // read() the same way.
-        try { pendingWriteSide?.close() } catch (e: Exception) { }
-        pendingWriteSide = null
+        // Unblock a read()-blocked pump; the write side is NEVER closed from
+        // here — the pump thread owns that fd outright and its writes are
+        // non-blocking (EAGAIN + bounded sleep), so the running flag is
+        // re-checked within milliseconds rather than never. Closing it
+        // cross-thread was a double-close/fd-reuse hazard: the pump's own
+        // close in its finally could then hit a recycled fd number belonging
+        // to the NEXT listen.
         try { audioPumpRecord?.stop() } catch (e: Exception) { }
         audioPumpRecord = null
         val pump = audioPumpThread ?: return
