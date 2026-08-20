@@ -129,6 +129,7 @@ public class SpeechToTextPlugin :
     // the call), so capture here and pipe PCM in via EXTRA_AUDIO_SOURCE.
     private var appAudioSource: Boolean = false
     private var audioPumpThread: Thread? = null
+    private var pendingReadSide: ParcelFileDescriptor? = null
     @Volatile private var audioPumpRunning: Boolean = false
     private val appAudioSampleRate = 16000
     private var speechRecognizer: SpeechRecognizer? = null
@@ -343,12 +344,15 @@ public class SpeechToTextPlugin :
                 // Per listen, never baked into the cached intent:
                 // setupRecognizerIntent reuses one Intent across listens, and a
                 // pipe fd left on it would be closed and useless by the second.
-                val readSide = attachAppAudioSource()
+                attachAppAudioSource()
                 speechRecognizer?.startListening(recognizerIntent)
-                // Our copy is redundant once the intent has been delivered; the
-                // recogniser holds its own dup. Closing before startListening
-                // would hand it a dead fd.
-                try { readSide?.close() } catch (e: Exception) { }
+                // Deliberately NOT closed here. SpeechRecognizerImpl.startListening
+                // is asynchronous — it posts to its own handler and parcels the
+                // intent LATER, so closing on return raced the parcel write and
+                // died with "Bad file descriptor" / ERROR_CLIENT on every listen
+                // (#559, observed 2026-08-20). The read end lives until
+                // stopAppAudioPump; keeping it open cannot delay EOF, which is
+                // signalled by the WRITE end closing.
             }
         }
         speechStartTime = System.currentTimeMillis()
@@ -927,23 +931,23 @@ public class SpeechToTextPlugin :
     // degrades to that old behaviour rather than breaking the listen: a call
     // that rates by tapping is worse than one that rates by voice, but a call
     // that crashes is worse than both.
-    private fun attachAppAudioSource(): ParcelFileDescriptor? {
-        val intent = recognizerIntent ?: return null
+    private fun attachAppAudioSource() {
+        val intent = recognizerIntent ?: return
         // A stale fd from a previous listen must never survive on the cached
         // intent: it is already closed, and leaving it would starve the
         // recogniser instead of letting it fall back to its own microphone.
         intent.removeExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE)
-        if (!appAudioSource) return null
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
-        val context = pluginContext ?: return null
+        if (!appAudioSource) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val context = pluginContext ?: return
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED) return null
+                != PackageManager.PERMISSION_GRANTED) return
 
         stopAppAudioPump()
 
         val minBuf = AudioRecord.getMinBufferSize(
                 appAudioSampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        if (minBuf <= 0) return null
+        if (minBuf <= 0) return
         val bufSize = minBuf * 2
 
         // VOICE_COMMUNICATION, not MIC: the answer clip is playing out of the
@@ -956,25 +960,20 @@ public class SpeechToTextPlugin :
         } catch (e: Exception) {
             debugLog("app audio source: AudioRecord ctor failed: $e")
             null
-        } ?: return null
+        } ?: return
         if (record.state != AudioRecord.STATE_INITIALIZED) {
             record.release()
-            return null
+            return
         }
 
         val pipe = try {
             ParcelFileDescriptor.createPipe()
         } catch (e: Exception) {
             record.release()
-            return null
+            return
         }
         val readSide = pipe[0]
         val writeSide = pipe[1]
-
-        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, readSide)
-        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
-        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, appAudioSampleRate)
-        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
 
         audioPumpRunning = true
         try {
@@ -984,8 +983,15 @@ public class SpeechToTextPlugin :
             try { readSide.close() } catch (e2: Exception) { }
             try { writeSide.close() } catch (e2: Exception) { }
             audioPumpRunning = false
-            return null
+            return
         }
+
+        // Only once the capture is genuinely running: extras attached before a
+        // failed startRecording would leave THIS listen parceling a closed fd.
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, readSide)
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, appAudioSampleRate)
+        intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
 
         val pump = Thread {
             val out = ParcelFileDescriptor.AutoCloseOutputStream(writeSide)
@@ -1012,8 +1018,8 @@ public class SpeechToTextPlugin :
         pump.isDaemon = true
         pump.name = "stt-app-audio-pump"
         audioPumpThread = pump
+        pendingReadSide = readSide
         pump.start()
-        return readSide
     }
 
     // Closing the write end is what tells the recogniser the audio ended, so
@@ -1022,6 +1028,8 @@ public class SpeechToTextPlugin :
     // feeding.
     private fun stopAppAudioPump() {
         audioPumpRunning = false
+        try { pendingReadSide?.close() } catch (e: Exception) { }
+        pendingReadSide = null
         val pump = audioPumpThread ?: return
         audioPumpThread = null
         try {
