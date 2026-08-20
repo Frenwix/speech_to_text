@@ -130,6 +130,8 @@ public class SpeechToTextPlugin :
     private var appAudioSource: Boolean = false
     private var audioPumpThread: Thread? = null
     private var pendingReadSide: ParcelFileDescriptor? = null
+    private var pendingWriteSide: ParcelFileDescriptor? = null
+    private var audioPumpRecord: AudioRecord? = null
     @Volatile private var audioPumpRunning: Boolean = false
     private val appAudioSampleRate = 16000
     private var speechRecognizer: SpeechRecognizer? = null
@@ -1019,6 +1021,8 @@ public class SpeechToTextPlugin :
         pump.name = "stt-app-audio-pump"
         audioPumpThread = pump
         pendingReadSide = readSide
+        pendingWriteSide = writeSide
+        audioPumpRecord = record
         pump.start()
     }
 
@@ -1030,6 +1034,21 @@ public class SpeechToTextPlugin :
         audioPumpRunning = false
         try { pendingReadSide?.close() } catch (e: Exception) { }
         pendingReadSide = null
+        // Unblock the pump BEFORE joining, or the join is theatre. When the
+        // recogniser never consumes the pipe (missing language pack: the
+        // French dead-loop, 2026-08-20), the pump fills the 64KB pipe buffer
+        // in ~2s and blocks in write() forever — the running flag is only
+        // re-checked between writes, so flag-then-join leaked one live thread
+        // and one ACTIVE AudioRecord per listen. The plugin outlives the call
+        // inside the Flutter engine, so those leaks silenced every later
+        // call's capture until the process died: "voice rating broke and
+        // stayed broken". Closing the write end makes the blocked write throw
+        // (its finally releases the record); stopping the record unblocks a
+        // read() the same way.
+        try { pendingWriteSide?.close() } catch (e: Exception) { }
+        pendingWriteSide = null
+        try { audioPumpRecord?.stop() } catch (e: Exception) { }
+        audioPumpRecord = null
         val pump = audioPumpThread ?: return
         audioPumpThread = null
         try {
@@ -1067,7 +1086,12 @@ public class SpeechToTextPlugin :
 
 
     override fun onPartialResults(results: Bundle?) = updateResults(results, false)
-    override fun onResults(results: Bundle?) = updateResults(results, true)
+    override fun onResults(results: Bundle?) {
+        // A listen that ends by itself must release the pump/record too —
+        // stop/cancel/destroy are not the only exits (#559 follow-up).
+        stopAppAudioPump()
+        updateResults(results, true)
+    }
     override fun onBeginningOfSpeech() {
         if (timer != null) {
             timer?.cancel()
@@ -1094,6 +1118,7 @@ public class SpeechToTextPlugin :
     }
 
     override fun onError(errorCode: Int) {
+        stopAppAudioPump()
         val delta = System.currentTimeMillis() - speechStartTime
         var errorReturn = errorCode
         if ( SpeechRecognizer.ERROR_NO_MATCH == errorCode && maxRms < speechThresholdRms ) {
