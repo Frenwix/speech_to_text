@@ -507,6 +507,9 @@ public class SpeechToTextPlugin :
         // the authority for "which languages can an onDevice listen actually
         // service" (#561).
         val onDeviceRecognizerInstalled = Collections.synchronizedSet(HashSet<String>())
+        val onDeviceSupported = Collections.synchronizedSet(HashSet<String>())
+        val onDevicePending = Collections.synchronizedSet(HashSet<String>())
+        val onDeviceAnswered = java.util.concurrent.atomic.AtomicBoolean(false)
         val online = Collections.synchronizedSet(HashSet<String>())
         val downloadable = Collections.synchronizedSet(HashSet<String>())
         val pending = Collections.synchronizedSet(HashSet<String>())
@@ -514,14 +517,23 @@ public class SpeechToTextPlugin :
 
         fun finish() {
             if (!responded.compareAndSet(false, true)) return
-            val onDevice = matchesTag(onDeviceInstalled, localeId)
+            val onDevice = matchesTag(onDeviceRecognizerInstalled, localeId)
+            // Status is grounded in the ON-DEVICE recogniser's answer ALONE.
+            // The union across both recognisers made the verdict depend on
+            // which services beat the 4s guard: both -> downloadable, only
+            // the network-capable one -> unsupported, neither -> unknown —
+            // observed live 2026-08-20 as the same language flapping between
+            // an Install button, "not available on this phone", and no panel
+            // at all across consecutive probes. A missing on-device answer is
+            // a missing ANSWER, never evidence about the language.
             val status = when {
-                !answered.get() -> "unknown"
-                matchesTag(installed, localeId) -> "installed"
-                matchesTag(pending, localeId) -> "pending"
-                matchesTag(downloadable, localeId) -> "downloadable"
+                !onDeviceAnswered.get() -> "unknown"
+                matchesTag(onDeviceRecognizerInstalled, localeId) -> "installed"
+                matchesTag(onDevicePending, localeId) -> "pending"
+                matchesTag(onDeviceSupported, localeId) -> "downloadable"
                 // An empty answer is not evidence of absence.
-                installed.isEmpty() && downloadable.isEmpty() && pending.isEmpty() -> "unknown"
+                onDeviceRecognizerInstalled.isEmpty() && onDeviceSupported.isEmpty() &&
+                        onDevicePending.isEmpty() -> "unknown"
                 else -> "unsupported"
             }
             respondAvailability(result, status, localeId, onDevice,
@@ -532,7 +544,10 @@ public class SpeechToTextPlugin :
         fun collect(support: RecognitionSupport, fromOnDeviceRecognizer: Boolean) {
             answered.set(true)
             if (fromOnDeviceRecognizer) {
+                onDeviceAnswered.set(true)
                 onDeviceRecognizerInstalled.addAll(support.installedOnDeviceLanguages)
+                onDeviceSupported.addAll(support.supportedOnDeviceLanguages)
+                onDevicePending.addAll(support.pendingOnDeviceLanguages)
             }
             onDeviceInstalled.addAll(support.installedOnDeviceLanguages)
             installed.addAll(support.installedOnDeviceLanguages)
