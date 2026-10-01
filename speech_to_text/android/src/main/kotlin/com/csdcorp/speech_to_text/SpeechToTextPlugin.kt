@@ -130,6 +130,9 @@ public class SpeechToTextPlugin :
     private var appAudioSource: Boolean = false
     private var audioPumpThread: Thread? = null
     private var pendingReadSide: ParcelFileDescriptor? = null
+    // Read ends of finished listens, still open because the recogniser may
+    // not have parcelled their intent yet. Main thread only.
+    private val retiredReadSides = mutableListOf<ParcelFileDescriptor>()
     private var audioPumpRecord: AudioRecord? = null
     @Volatile private var audioPumpRunning: Boolean = false
     private val appAudioSampleRate = 16000
@@ -354,6 +357,12 @@ public class SpeechToTextPlugin :
                 // (#559, observed 2026-08-20). The read end lives until
                 // stopAppAudioPump; keeping it open cannot delay EOF, which is
                 // signalled by the WRITE end closing.
+                //
+                // Nor is it closed by stop/cancel (#806): a stop already
+                // queued on the main looper runs BEFORE the recogniser's own
+                // MSG_START, so closing there re-created the #559 race — and
+                // a parcel failure inside the framework's handleMessage is
+                // fatal, not ERROR_CLIENT. See releaseRetiredReadSides.
             }
         }
         speechStartTime = System.currentTimeMillis()
@@ -899,6 +908,7 @@ public class SpeechToTextPlugin :
         lastOnDevice = onDevice
         speechRecognizer?.destroy()
         speechRecognizer = null
+        releaseRetiredReadSides()
         handler.post {
             run {
                 debugLog("Creating recognizer")
@@ -1120,7 +1130,7 @@ public class SpeechToTextPlugin :
     // feeding.
     private fun stopAppAudioPump() {
         audioPumpRunning = false
-        try { pendingReadSide?.close() } catch (e: Exception) { }
+        pendingReadSide?.let { retiredReadSides.add(it) }
         pendingReadSide = null
         // Unblock a read()-blocked pump; the write side is NEVER closed from
         // here — the pump thread owns that fd outright and its writes are
@@ -1148,8 +1158,24 @@ public class SpeechToTextPlugin :
                     debugLog("Recognizer destroy")
                     speechRecognizer?.destroy();
                     speechRecognizer = null;
+                    releaseRetiredReadSides()
                 }
         }, 50 )
+    }
+
+    // The only two points at which a retired read end is provably finished
+    // with (#806). (1) Any recogniser callback: callbacks and the
+    // recogniser's MSG_START both run on the main looper, and MSG_START is
+    // queued inside startListening, so by the time a callback runs every
+    // earlier listen's intent has been parcelled. (2) After destroy(): it
+    // drops pending tasks and nulls the service, so a queued MSG_START bails
+    // before parcelling. Never call this from stop/cancel.
+    private fun releaseRetiredReadSides() {
+        if (retiredReadSides.isEmpty()) return
+        for (fd in retiredReadSides) {
+            try { fd.close() } catch (e: Exception) { }
+        }
+        retiredReadSides.clear()
     }
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray): Boolean {
         when (requestCode) {
@@ -1172,6 +1198,7 @@ public class SpeechToTextPlugin :
         // A listen that ends by itself must release the pump/record too —
         // stop/cancel/destroy are not the only exits (#559 follow-up).
         stopAppAudioPump()
+        releaseRetiredReadSides()
         updateResults(results, true)
     }
     override fun onBeginningOfSpeech() {
@@ -1201,6 +1228,7 @@ public class SpeechToTextPlugin :
 
     override fun onError(errorCode: Int) {
         stopAppAudioPump()
+        releaseRetiredReadSides()
         val delta = System.currentTimeMillis() - speechStartTime
         var errorReturn = errorCode
         if ( SpeechRecognizer.ERROR_NO_MATCH == errorCode && maxRms < speechThresholdRms ) {
@@ -1262,7 +1290,7 @@ public class SpeechToTextPlugin :
         }
     }
 
-    override fun onReadyForSpeech(p0: Bundle?) {}
+    override fun onReadyForSpeech(p0: Bundle?) = releaseRetiredReadSides()
     override fun onBufferReceived(p0: ByteArray?) {}
     override fun onEvent(p0: Int, p1: Bundle?) {}
 
