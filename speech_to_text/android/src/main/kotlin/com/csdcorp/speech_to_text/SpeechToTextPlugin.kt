@@ -121,6 +121,27 @@ public class SpeechToTextPlugin :
     private var bluetoothDisabled = true // final bluetooth state (combines user-defined option and permissions)
     private var resultSent: Boolean = false
     private var lastOnDevice: Boolean = false
+    // Recogniser health (Frenwix/colloquial#818). The recogniser is kept for
+    // the life of the process, and once its connection to the recognition
+    // service breaks, startListening on it reaches nothing: no session, no
+    // onStartListening in the service, and the app retried on the dead object
+    // until the process was killed. A listen that produced no sign of life
+    // from the service, or an error that means the connection is gone, now
+    // gets a fresh recogniser on the next listen. Main thread only.
+    private var listenReachedService = true
+    private var listenStartedAt: Long = 0
+    private var recreateBeforeNextListen = false
+    private var listensStarted = 0
+    private var listensReachedService = 0
+    private var recognizersRecreated = 0
+    private var lastNativeError: Int? = null
+    private val serviceAnswerWindowMs = 3000L
+    private val brokenConnectionErrors = setOf(
+            SpeechRecognizer.ERROR_CLIENT,
+            SpeechRecognizer.ERROR_SERVER,
+            SpeechRecognizer.ERROR_SERVER_DISCONNECTED,
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
+            SpeechRecognizer.ERROR_TOO_MANY_REQUESTS)
     // Feed the recogniser OUR capture instead of letting it open its own
     // (#559). While this app owns a Telecom call, Android hands a
     // different-process recogniser a successfully-opened input that reads
@@ -250,6 +271,12 @@ public class SpeechToTextPlugin :
                 }
                 "stop" -> stopListening(result)
                 "cancel" -> cancelListening(result)
+                "resetRecognizer" -> resetRecognizer(result)
+                "recognizerHealth" -> result.success(hashMapOf<String, Any?>(
+                        "listensStarted" to listensStarted,
+                        "listensReachedService" to listensReachedService,
+                        "recognizersRecreated" to recognizersRecreated,
+                        "lastNativeError" to lastNativeError))
                 "locales" -> locales(result)
                 "recognitionAvailability" -> {
                     val localeId = call.argument<String>("localeId")
@@ -336,7 +363,13 @@ public class SpeechToTextPlugin :
         var listenMode = enumValues<ListenMode>()[listenModeIndex]
 
         resultSent = false
+        if (recreateBeforeNextListen || !listenReachedService) {
+            discardRecognizer()
+        }
         createRecognizer(onDevice, listenMode, pauseFor)
+        listenReachedService = false
+        listenStartedAt = System.currentTimeMillis()
+        listensStarted++
         minRms = 1000.0F
         maxRms = -100.0F
         debugLog("Start listening")
@@ -395,6 +428,7 @@ public class SpeechToTextPlugin :
             return
         }
         debugLog("Stop listening")
+        forgiveEarlyEnd()
         stopAppAudioPump()
         handler.post {
             run {
@@ -415,6 +449,7 @@ public class SpeechToTextPlugin :
             return
         }
         debugLog("Cancel listening")
+        forgiveEarlyEnd()
         stopAppAudioPump()
         handler.post {
             run {
@@ -1150,6 +1185,53 @@ public class SpeechToTextPlugin :
         }
     }
 
+    // The app ends listens itself all the time (a card advances, a rating
+    // lands). Ended within the first moments, before the service could have
+    // answered, that says nothing about the recogniser; ended later with no
+    // answer at all, it does.
+    private fun forgiveEarlyEnd() {
+        if (!listenReachedService &&
+                System.currentTimeMillis() - listenStartedAt < serviceAnswerWindowMs) {
+            listenReachedService = true
+        }
+    }
+
+    private fun markReachedService() {
+        if (!listenReachedService) {
+            listenReachedService = true
+            listensReachedService++
+        }
+    }
+
+    // Synchronous, on the main thread, before the next createRecognizer: the
+    // old object is gone before a new one is made, so createRecognizer's
+    // reuse check cannot hand the dead one back. destroy() also makes any
+    // MSG_START still queued for it bail before parcelling, so the retired
+    // read ends can be closed here (see releaseRetiredReadSides).
+    private fun discardRecognizer() {
+        stopAppAudioPump()
+        speechRecognizer?.destroy()
+        speechRecognizer = null
+        releaseRetiredReadSides()
+        previousRecognizerLang = null
+        recreateBeforeNextListen = false
+        listenReachedService = true
+        recognizersRecreated++
+        debugLog("Recognizer discarded")
+    }
+
+    // Called by the app at the start of every call, so nothing an earlier
+    // call left behind can reach this one (#818).
+    private fun resetRecognizer(result: Result) {
+        if (isListening()) {
+            result.success(false)
+            return
+        }
+        discardRecognizer()
+        lastNativeError = null
+        result.success(true)
+    }
+
     private fun destroyRecognizer() {
         stopAppAudioPump()
 
@@ -1193,8 +1275,12 @@ public class SpeechToTextPlugin :
     }
 
 
-    override fun onPartialResults(results: Bundle?) = updateResults(results, false)
+    override fun onPartialResults(results: Bundle?) {
+        markReachedService()
+        updateResults(results, false)
+    }
     override fun onResults(results: Bundle?) {
+        markReachedService()
         // A listen that ends by itself must release the pump/record too —
         // stop/cancel/destroy are not the only exits (#559 follow-up).
         stopAppAudioPump()
@@ -1202,6 +1288,7 @@ public class SpeechToTextPlugin :
         updateResults(results, true)
     }
     override fun onBeginningOfSpeech() {
+        markReachedService()
         if (timer != null) {
             timer?.cancel()
             timer = null
@@ -1227,6 +1314,10 @@ public class SpeechToTextPlugin :
     }
 
     override fun onError(errorCode: Int) {
+        lastNativeError = errorCode
+        // Errors that mean the link to the service is broken, not that the
+        // user said nothing: the next listen gets a fresh recogniser (#818).
+        if (errorCode in brokenConnectionErrors) recreateBeforeNextListen = true
         stopAppAudioPump()
         releaseRetiredReadSides()
         val delta = System.currentTimeMillis() - speechStartTime
@@ -1290,7 +1381,10 @@ public class SpeechToTextPlugin :
         }
     }
 
-    override fun onReadyForSpeech(p0: Bundle?) = releaseRetiredReadSides()
+    override fun onReadyForSpeech(p0: Bundle?) {
+        markReachedService()
+        releaseRetiredReadSides()
+    }
     override fun onBufferReceived(p0: ByteArray?) {}
     override fun onEvent(p0: Int, p1: Bundle?) {}
 
