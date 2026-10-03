@@ -150,10 +150,11 @@ public class SpeechToTextPlugin :
     // the call), so capture here and pipe PCM in via EXTRA_AUDIO_SOURCE.
     private var appAudioSource: Boolean = false
     private var audioPumpThread: Thread? = null
-    private var pendingReadSide: ParcelFileDescriptor? = null
-    // Read ends of finished listens, still open because the recogniser may
-    // not have parcelled their intent yet. Main thread only.
-    private val retiredReadSides = mutableListOf<ParcelFileDescriptor>()
+    // False from a listen's start until its onReadyForSpeech (#806). The
+    // service always answers a listen with onReadyForSpeech first, so a
+    // result or error arriving before it belongs to the PREVIOUS listen —
+    // and must not stop the audio of the one just started.
+    private var listenReady = true
     private var audioPumpRecord: AudioRecord? = null
     @Volatile private var audioPumpRunning: Boolean = false
     private val appAudioSampleRate = 16000
@@ -363,6 +364,7 @@ public class SpeechToTextPlugin :
         var listenMode = enumValues<ListenMode>()[listenModeIndex]
 
         resultSent = false
+        t806("start: recreate=$recreateBeforeNextListen reached=$listenReachedService")
         if (recreateBeforeNextListen || !listenReachedService) {
             discardRecognizer()
         }
@@ -381,21 +383,10 @@ public class SpeechToTextPlugin :
                 // Per listen, never baked into the cached intent:
                 // setupRecognizerIntent reuses one Intent across listens, and a
                 // pipe fd left on it would be closed and useless by the second.
-                attachAppAudioSource()
-                speechRecognizer?.startListening(recognizerIntent)
-                // Deliberately NOT closed here. SpeechRecognizerImpl.startListening
-                // is asynchronous — it posts to its own handler and parcels the
-                // intent LATER, so closing on return raced the parcel write and
-                // died with "Bad file descriptor" / ERROR_CLIENT on every listen
-                // (#559, observed 2026-08-20). The read end lives until
-                // stopAppAudioPump; keeping it open cannot delay EOF, which is
-                // signalled by the WRITE end closing.
-                //
-                // Nor is it closed by stop/cancel (#806): a stop already
-                // queued on the main looper runs BEFORE the recogniser's own
-                // MSG_START, so closing there re-created the #559 race — and
-                // a parcel failure inside the framework's handleMessage is
-                // fatal, not ERROR_CLIENT. See releaseRetiredReadSides.
+                val listenIntent = listenIntent()
+                listenReady = false
+                t806("startListening(intent fd=${fdNum(listenIntent?.getParcelableExtra<ParcelFileDescriptor>(RecognizerIntent.EXTRA_AUDIO_SOURCE))})")
+                if (listenIntent != null) speechRecognizer?.startListening(listenIntent)
             }
         }
         speechStartTime = System.currentTimeMillis()
@@ -941,9 +932,9 @@ public class SpeechToTextPlugin :
             return
         }
         lastOnDevice = onDevice
+        t806("createRecognizer")
         speechRecognizer?.destroy()
         speechRecognizer = null
-        releaseRetiredReadSides()
         handler.post {
             run {
                 debugLog("Creating recognizer")
@@ -1041,23 +1032,32 @@ public class SpeechToTextPlugin :
     // degrades to that old behaviour rather than breaking the listen: a call
     // that rates by tapping is worse than one that rates by voice, but a call
     // that crashes is worse than both.
-    private fun attachAppAudioSource() {
-        val intent = recognizerIntent ?: return
-        // A stale fd from a previous listen must never survive on the cached
-        // intent: it is already closed, and leaving it would starve the
-        // recogniser instead of letting it fall back to its own microphone.
+    //
+    // Each listen gets its OWN copy of the cached intent, and the read end
+    // goes only into that copy (#806). SpeechRecognizerImpl keeps the intent
+    // by reference in a queued MSG_START and parcels it later — up to the
+    // service connecting — so anything that closed or swapped the fd in the
+    // meantime made it parcel a dead descriptor: ERROR_CLIENT on Android 17,
+    // a fatal "Bad file descriptor" in the framework's handleMessage on older
+    // releases. The plugin therefore never closes a read end at all: the copy
+    // in the queued message is its only reference, and it is closed when that
+    // is collected, after the parcel or after a destroy dropped the message.
+    // EOF does not depend on it — that is the WRITE end closing.
+    private fun listenIntent(): Intent? {
+        val base = recognizerIntent ?: return null
+        val intent = Intent(base)
         intent.removeExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE)
-        if (!appAudioSource) return
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
-        val context = pluginContext ?: return
+        if (!appAudioSource) return intent
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return intent
+        val context = pluginContext ?: return intent
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED) return
+                != PackageManager.PERMISSION_GRANTED) return intent
 
         stopAppAudioPump()
 
         val minBuf = AudioRecord.getMinBufferSize(
                 appAudioSampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        if (minBuf <= 0) return
+        if (minBuf <= 0) return intent
         val bufSize = minBuf * 2
 
         // VOICE_COMMUNICATION, not MIC: the answer clip is playing out of the
@@ -1070,17 +1070,17 @@ public class SpeechToTextPlugin :
         } catch (e: Exception) {
             debugLog("app audio source: AudioRecord ctor failed: $e")
             null
-        } ?: return
+        } ?: return intent
         if (record.state != AudioRecord.STATE_INITIALIZED) {
             record.release()
-            return
+            return intent
         }
 
         val pipe = try {
             ParcelFileDescriptor.createPipe()
         } catch (e: Exception) {
             record.release()
-            return
+            return intent
         }
         val readSide = pipe[0]
         val writeSide = pipe[1]
@@ -1093,7 +1093,7 @@ public class SpeechToTextPlugin :
             try { readSide.close() } catch (e2: Exception) { }
             try { writeSide.close() } catch (e2: Exception) { }
             audioPumpRunning = false
-            return
+            return intent
         }
 
         // Only once the capture is genuinely running: extras attached before a
@@ -1154,9 +1154,9 @@ public class SpeechToTextPlugin :
         pump.isDaemon = true
         pump.name = "stt-app-audio-pump"
         audioPumpThread = pump
-        pendingReadSide = readSide
         audioPumpRecord = record
         pump.start()
+        return intent
     }
 
     // Closing the write end is what tells the recogniser the audio ended, so
@@ -1165,8 +1165,7 @@ public class SpeechToTextPlugin :
     // feeding.
     private fun stopAppAudioPump() {
         audioPumpRunning = false
-        pendingReadSide?.let { retiredReadSides.add(it) }
-        pendingReadSide = null
+        t806("stop pump")
         // Unblock a read()-blocked pump; the write side is NEVER closed from
         // here — the pump thread owns that fd outright and its writes are
         // non-blocking (EAGAIN + bounded sleep), so the running flag is
@@ -1205,14 +1204,14 @@ public class SpeechToTextPlugin :
 
     // Synchronous, on the main thread, before the next createRecognizer: the
     // old object is gone before a new one is made, so createRecognizer's
-    // reuse check cannot hand the dead one back. destroy() also makes any
-    // MSG_START still queued for it bail before parcelling, so the retired
-    // read ends can be closed here (see releaseRetiredReadSides).
+    // reuse check cannot hand the dead one back. (destroy() is itself queued
+    // BEHIND any MSG_START still waiting, so that start still parcels — which
+    // is why read ends are never closed by the plugin; see listenIntent.)
     private fun discardRecognizer() {
         stopAppAudioPump()
+        t806("discard")
         speechRecognizer?.destroy()
         speechRecognizer = null
-        releaseRetiredReadSides()
         previousRecognizerLang = null
         recreateBeforeNextListen = false
         listenReachedService = true
@@ -1238,27 +1237,17 @@ public class SpeechToTextPlugin :
         handler.postDelayed( {
                 run {
                     debugLog("Recognizer destroy")
+                    t806("delayed destroy")
                     speechRecognizer?.destroy();
                     speechRecognizer = null;
-                    releaseRetiredReadSides()
                 }
         }, 50 )
     }
 
-    // The only two points at which a retired read end is provably finished
-    // with (#806). (1) Any recogniser callback: callbacks and the
-    // recogniser's MSG_START both run on the main looper, and MSG_START is
-    // queued inside startListening, so by the time a callback runs every
-    // earlier listen's intent has been parcelled. (2) After destroy(): it
-    // drops pending tasks and nulls the service, so a queued MSG_START bails
-    // before parcelling. Never call this from stop/cancel.
-    private fun releaseRetiredReadSides() {
-        if (retiredReadSides.isEmpty()) return
-        for (fd in retiredReadSides) {
-            try { fd.close() } catch (e: Exception) { }
-        }
-        retiredReadSides.clear()
-    }
+    private fun fdNum(p: ParcelFileDescriptor?): Int = try { p?.fd ?: -1 } catch (e: Exception) { -2 }
+    private fun recId(): Int = System.identityHashCode(speechRecognizer)
+    // Pipe/listen lifecycle trace (#806), behind the plugin's debug logging.
+    private fun t806(msg: String) = debugLog("pipe L$listensStarted rec=${recId()} $msg")
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray): Boolean {
         when (requestCode) {
             speechToTextPermissionCode -> {
@@ -1283,8 +1272,8 @@ public class SpeechToTextPlugin :
         markReachedService()
         // A listen that ends by itself must release the pump/record too —
         // stop/cancel/destroy are not the only exits (#559 follow-up).
-        stopAppAudioPump()
-        releaseRetiredReadSides()
+        t806("onResults ready=$listenReady")
+        if (listenReady) stopAppAudioPump()
         updateResults(results, true)
     }
     override fun onBeginningOfSpeech() {
@@ -1318,8 +1307,8 @@ public class SpeechToTextPlugin :
         // Errors that mean the link to the service is broken, not that the
         // user said nothing: the next listen gets a fresh recogniser (#818).
         if (errorCode in brokenConnectionErrors) recreateBeforeNextListen = true
-        stopAppAudioPump()
-        releaseRetiredReadSides()
+        t806("onError $errorCode ready=$listenReady")
+        if (listenReady) stopAppAudioPump()
         val delta = System.currentTimeMillis() - speechStartTime
         var errorReturn = errorCode
         if ( SpeechRecognizer.ERROR_NO_MATCH == errorCode && maxRms < speechThresholdRms ) {
@@ -1382,8 +1371,9 @@ public class SpeechToTextPlugin :
     }
 
     override fun onReadyForSpeech(p0: Bundle?) {
+        t806("onReadyForSpeech")
+        listenReady = true
         markReachedService()
-        releaseRetiredReadSides()
     }
     override fun onBufferReceived(p0: ByteArray?) {}
     override fun onEvent(p0: Int, p1: Bundle?) {}
