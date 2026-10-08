@@ -156,6 +156,13 @@ public class SpeechToTextPlugin :
     // and must not stop the audio of the one just started.
     private var listenReady = true
     private var audioPumpRecord: AudioRecord? = null
+    // Each startListening takes a number; stop and cancel mark every number so
+    // far as ended (#892). The start's own work is posted to the handler, so a
+    // stop or cancel can land between the call and that work; without this the
+    // posted block still opened an AudioRecord that nothing would ever close,
+    // and the microphone stayed on after the call.
+    private var listenGeneration = 0
+    private var endedGeneration = 0
     @Volatile private var audioPumpRunning: Boolean = false
     private val appAudioSampleRate = 16000
     private var speechRecognizer: SpeechRecognizer? = null
@@ -191,6 +198,8 @@ public class SpeechToTextPlugin :
     }
 
     override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+        endedGeneration = listenGeneration
+        stopAppAudioPump()
         this.pluginContext = null;
         channel?.setMethodCallHandler(null)
         channel = null
@@ -369,6 +378,7 @@ public class SpeechToTextPlugin :
             discardRecognizer()
         }
         createRecognizer(onDevice, listenMode, pauseFor)
+        val generation = ++listenGeneration
         listenReachedService = false
         listenStartedAt = System.currentTimeMillis()
         listensStarted++
@@ -380,6 +390,10 @@ public class SpeechToTextPlugin :
         setupRecognizerIntent(languageTag, partialResults, listenMode, onDevice, pauseFor )
         handler.post {
             run {
+                if (endedGeneration >= generation) {
+                    t806("start skipped: ended before it ran")
+                    return@run
+                }
                 // Per listen, never baked into the cached intent:
                 // setupRecognizerIntent reuses one Intent across listens, and a
                 // pipe fd left on it would be closed and useless by the second.
@@ -414,6 +428,12 @@ public class SpeechToTextPlugin :
     }
 
     private fun stopListening(result: Result) {
+        // Whatever the listening flag says (#892): a listen whose start is
+        // still queued, or that ended itself before its recogniser was ready,
+        // reads as not listening, and returning before this left its
+        // AudioRecord running with nothing left to stop it.
+        endedGeneration = listenGeneration
+        stopAppAudioPump()
         if (sdkVersionTooLow() || isNotInitialized() || isNotListening()) {
             result.success(false)
             return
@@ -435,6 +455,12 @@ public class SpeechToTextPlugin :
     }
 
     private fun cancelListening(result: Result) {
+        // Whatever the listening flag says (#892): a listen whose start is
+        // still queued, or that ended itself before its recogniser was ready,
+        // reads as not listening, and returning before this left its
+        // AudioRecord running with nothing left to stop it.
+        endedGeneration = listenGeneration
+        stopAppAudioPump()
         if (sdkVersionTooLow() || isNotInitialized() || isNotListening()) {
             result.success(false)
             return
