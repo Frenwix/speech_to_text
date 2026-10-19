@@ -20,7 +20,19 @@ public enum SwiftSpeechToTextMethods: String {
   case locales
   case recognitionAvailability
   case triggerModelDownload
+  case setAppAudioSource
   case unknown  // just for testing
+}
+
+/// Colloquial fork: a capture the host app already runs, which a listen can
+/// be fed from instead of opening its own AVAudioEngine. During a call the
+/// app runs one voice-processing engine; a second engine on the input node
+/// takes the mic from it and drops the call out of voice-processing mode.
+public enum SpeechToTextAppAudio {
+  /// Set by the host app. Called with a sink to start delivering input
+  /// buffers to it, or nil to stop. Returns false when the app has no
+  /// capture running, and the listen then captures for itself.
+  public static var connect: ((((AVAudioPCMBuffer) -> Void)?) -> Bool)?
 }
 
 public enum SwiftSpeechToTextCallbackMethods: String {
@@ -103,6 +115,8 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   private var listening = false
   private var stopping = false
   private var audioEngine: AVAudioEngine?
+  private var appAudioSource = false
+  private var listeningOnAppAudio = false
   private var inputNode: AVAudioInputNode?
   private var aggregateResults: SpeechResultAggregator = SpeechResultAggregator()
   private let jsonEncoder = JSONEncoder()
@@ -232,6 +246,14 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
             return
         }
         recognitionAvailability(result, localeId: localeId)
+    case SwiftSpeechToTextMethods.setAppAudioSource.rawValue:
+      // Opt-in from the host app, as on Android: only the app knows it is
+      // inside a call. Answers whether a source is registered to use.
+      let enabled = (call.arguments as? [String: AnyObject])?["enabled"] as? Bool ?? false
+      appAudioSource = enabled && SpeechToTextAppAudio.connect != nil
+      DispatchQueue.main.async {
+        result(self.appAudioSource)
+      }
     case SwiftSpeechToTextMethods.triggerModelDownload.rawValue:
         // iOS has no API to fetch a dictation language on the app's behalf — the
         // user does it in Settings. Answering false keeps the Dart side honest
@@ -450,6 +472,10 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   }
 
   private func stopCurrentListen() {
+    if listeningOnAppAudio {
+      _ = SpeechToTextAppAudio.connect?(nil)
+      listeningOnAppAudio = false
+    }
     self.currentRequest?.endAudio()
     stopAllPlayers()
     do {
@@ -550,16 +576,29 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
         }
         sound.play()
       }
-      if !initAudioEngine(result) {
-        return
-      }
-      if inputNode?.inputFormat(forBus: 0).channelCount == 0 {
-        throw SpeechToTextError.runtimeError("Not enough available inputs.")
-      }
       self.currentRequest = SFSpeechAudioBufferRecognitionRequest()
       guard let currentRequest = self.currentRequest else {
         sendBoolResult(false, result)
         return
+      }
+      if appAudioSource {
+        // The app's capture delivers on its own audio thread, exactly as a
+        // tap here would. Buffers that arrive before the task starts queue
+        // on the request.
+        listeningOnAppAudio = SpeechToTextAppAudio.connect?({ [weak self] buffer in
+          currentRequest.append(buffer)
+          self?.updateSoundLevel(buffer: buffer)
+        }) ?? false
+      }
+      // No capture running in the app (no call): capture for ourselves.
+      if !listeningOnAppAudio {
+        if !initAudioEngine(result) {
+          self.currentRequest = nil
+          return
+        }
+        if inputNode?.inputFormat(forBus: 0).channelCount == 0 {
+          throw SpeechToTextError.runtimeError("Not enough available inputs.")
+        }
       }
       currentRequest.shouldReportPartialResults = true
       if #available(iOS 13.0, *), onDevice {
@@ -582,6 +621,16 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
         currentRequest.addsPunctuation = autoPunctuation
       }
       self.currentTask = self.recognizer?.recognitionTask(with: currentRequest, delegate: self)
+      if listeningOnAppAudio {
+        if nil == listeningSound {
+          listening = true
+          self.invokeFlutter(
+            SwiftSpeechToTextCallbackMethods.notifyStatus,
+            arguments: SpeechToTextStatus.listening.rawValue)
+        }
+        sendBoolResult(true, result)
+        return
+      }
       let recordingFormat = inputNode?.outputFormat(forBus: self.busForNodeTap)
       var fmt: AVAudioFormat!
       #if os(iOS)
